@@ -1,0 +1,16 @@
+# RUN PROJECT
+
+Run on different provider use this .env conf : 
+
+```
+RPC_URL="http://127.0.0.1:8545"
+CHAIN_ID=31337
+NETWORK_NAME="Anvil-Local"
+GAS_LIMIT=21000
+GAS_PRICE=20000000000
+
+```
+
+- cargo run
+
+
