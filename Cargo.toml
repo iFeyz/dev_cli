@@ -1,0 +1,33 @@
+[package]
+name = "alloy_01"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+alloy = { version = "1.0.13", features = [
+    "eips",
+    "full",
+    "json-rpc",
+    "node-bindings",
+    "rpc-client",
+    "rpc-types-debug",
+    "rpc-types-trace",
+    "signer-aws",
+    "signer-gcp",
+    "signer-keystore",
+    "signer-ledger",
+    "signer-mnemonic",
+    "signer-trezor",
+    "signer-yubihsm",
+] }
+anyhow = "1.0.98"
+atty = "0.2.14"
+colored = "3.0.0"
+crossterm = "0.29.0"
+dotenvy = "0.15.7"
+rpassword = "7.4.0"
+serde_json = "1.0.141"
+tabled = "0.20.0"
+terminal_size = "0.4.2"
+tokio = { version = "1.0", features = ["full"] }
+
