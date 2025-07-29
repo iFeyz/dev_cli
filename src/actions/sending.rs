@@ -38,7 +38,6 @@ impl Display for SendError {
     }
 }
 
-// Function to map errors to specific codes
 fn map_error_to_code(error_msg: &str) -> i8 {
     match error_msg {
         // Parsing private key error
@@ -85,7 +84,6 @@ impl SendError {
 }
 
 
-// Fonction pour récupérer les infos d'une transaction existante
 pub async fn get_transaction_info(tx_hash: &str) -> Result<TransactionInfo, SendError> {
     let provider = ProviderBuilder::new()
         .connect("http://127.0.0.1:8545")
