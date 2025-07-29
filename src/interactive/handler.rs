@@ -1,11 +1,16 @@
 use anyhow::Result;
 use crate::actions::{
     info::TransactionInfo,
-    sending::{SendError, send_eth, get_transaction_info as get_tx_info, SendTransactionRequest},
+    sending::{SendError, get_transaction_info as get_tx_info, SendTransactionRequest},
 };
-use alloy::primitives::{U256};
+use alloy::primitives::{U256, Address};
 use alloy::signers::local::PrivateKeySigner;
+use alloy::providers::ProviderBuilder;
+use alloy::transports::http::reqwest::Url;
 
+
+use crate::config::simple_config::Config;
+use crate::model::interaction::{Transaction, UserCredentials, RequestConfig, Requestable, RequestResult, TransactionData};
 
 pub struct MenuHandlers;
 
@@ -14,25 +19,37 @@ impl MenuHandlers {
         Self
     }
 
-    pub async fn send_transaction(
-        &self,
-        _to_address: &str,
-        _amount: &str,
-        _private_key: &str,
-    ) -> Result<TransactionInfo, SendError> {
-
-        let transaction_request = SendTransactionRequest {
-            to: _to_address.to_string(),    
-            value: _amount.parse::<U256>().unwrap(),
-            gas_limit: U256::from(21000),
-            gas_price: U256::from(1000000000),
-            trace_call: true,
-            private_key: _private_key.parse::<PrivateKeySigner>().unwrap(),
-        };
-        send_eth(transaction_request).await
-    }
-
     pub async fn get_transaction_info(&self, tx_hash: &str) -> Result<TransactionInfo, SendError> {
         get_tx_info(tx_hash).await
     }
+
+    pub async fn send_transaction_with_trace(&self, _to_address : &str, _amount : &str, _private_key : &str) -> RequestResult<TransactionData> {
+        let config = Config::load().unwrap();
+        let provider = ProviderBuilder::new().connect_http(config.rpc_url.parse::<Url>().unwrap());
+        let transaction = Transaction::new_eth_transfer(
+            _to_address.parse::<Address>().unwrap(),
+            _amount.parse::<U256>().unwrap(),
+            UserCredentials::new(_private_key.parse::<PrivateKeySigner>().unwrap()),
+            Some(RequestConfig::default()),
+        );
+        //Get a config provider
+        let result = transaction.trace_and_execute(&provider).await;
+        result
+    }
+
+    pub async fn send_transaction_without_trace(&self, _to_address : &str, _amount : &str, _private_key : &str) -> RequestResult<TransactionData> {
+        let config = Config::load().unwrap();
+        let provider = ProviderBuilder::new().connect_http(config.rpc_url.parse::<Url>().unwrap());
+        let transaction = Transaction::new_eth_transfer(
+            _to_address.parse::<Address>().unwrap(),
+            _amount.parse::<U256>().unwrap(),
+            UserCredentials::new(_private_key.parse::<PrivateKeySigner>().unwrap()),
+            Some(RequestConfig::default()),
+        );
+        let result = transaction.request(&provider).await;
+        result
+    }
+
+
+
 }

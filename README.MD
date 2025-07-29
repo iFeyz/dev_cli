@@ -11,6 +11,22 @@ GAS_PRICE=20000000000
 
 ```
 
+
+FORK HYPE EVM 
+
+anvil \
+  --fork-url wss://hyperliquid.drpc.org \
+  --fork-block-number 900000 \
+  --chain-id 999 \
+  --accounts 10 \
+  --balance 1000000000000000000
+
 - cargo run
 
+# TODO
+
+- Add better provider handler
+- Create a smart contract deployer 
+- Add interaction to SM 
+- Add a deployer option
 

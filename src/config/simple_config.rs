@@ -1,12 +1,16 @@
 use anyhow::{Result, Context};
 use std::env;
 
+use alloy::providers::ProviderBuilder;
+use alloy::providers::Provider;
+use alloy::network::Network;
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub rpc_url: String,
     pub chain_id: u64,
     pub network_name: String,
-    pub gas_limit: u64,
+    pub gas_limit: u64, 
     pub gas_price: Option<u64>,
 }
 

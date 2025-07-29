@@ -114,10 +114,11 @@ impl InteractiveMenu {
         let status_info = self.get_status_info().await;
         self.display.show_status_bar(&status_info)?;
 
-        let choice = self.prompts.get_menu_choice(1, 2).await?;
+        let choice = self.prompts.get_menu_choice(1, 3).await?;
         match choice {
-            1 => self.handle_send_eth().await?,
-            2 => self.state.go_back(),
+            1 => self.handle_send_eth_with_trace().await?,
+            2 => self.handle_send_eth_without_trace().await?,
+            3 => self.state.go_back(),
             _ => unreachable!(),
         }
         Ok(())
@@ -148,10 +149,44 @@ impl InteractiveMenu {
     /// ===============================
     ///     UTILITY FUNCTIONS
     /// ===============================
-
-    async fn handle_send_eth(&mut self) -> Result<()> {
+    /// 
+    /// 
+    
+    async fn handle_send_eth_without_trace(&mut self) -> Result<()> {
         //self.display.clear_screen()?;
-        self.display.show_header("Send ETH")?;
+        self.display.show_header("Send ETH without trace")?;
+        
+        let to_address = self.prompts.get_ethereum_address("Enter recipient address").await?;
+        let amount = self.prompts.get_amount("Enter amount to send (ETH)").await?;
+        let private_key = self.prompts.get_private_key_secure().await?;
+
+        self.display.show_transaction_preview(&to_address, &amount, "ETH", &self.config.network_name)?;
+        
+        if !self.prompts.confirm("Confirm transaction").await? {
+            self.display.show_info("Transaction cancelled")?;
+            self.wait_for_key().await?;
+            return Ok(());
+        }
+
+        let result = self.handlers.send_transaction_without_trace(&to_address, &amount, &private_key).await;
+        match result {
+            result if result.success => {
+                self.display.show_success("Transaction sent successfully!")?;
+                self.display.show_transaction_result(&result.transaction_hash.unwrap().to_string())?;
+            }
+            result if result.error.is_some() => {
+                self.display.show_error(&format!("Transaction failed: {}", result.error.unwrap().to_string()))?;
+            }
+            _ => {
+                self.display.show_error("Transaction failed")?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn handle_send_eth_with_trace(&mut self) -> Result<()> {
+        //self.display.clear_screen()?;
+        self.display.show_header("Send ETH with trace")?;
 
         let to_address = self.prompts.get_ethereum_address("Enter recipient address").await?;
         let amount = self.prompts.get_amount("Enter amount to send (ETH)").await?;
@@ -167,16 +202,20 @@ impl InteractiveMenu {
 
         self.display.show_progress("Sending transaction")?;
     
-        match self.handlers.send_transaction(&to_address, &amount, &private_key).await {
-            Ok(tx_hash) => {
+        let result = self.handlers.send_transaction_with_trace(&to_address, &amount, &private_key).await;
+        match result {
+
+            result if result.success => {
                 self.display.show_success("Transaction sent successfully!")?;
-                self.display.show_transaction_result(&tx_hash.to_string())?;
+                self.display.show_transaction_result(&result.transaction_hash.unwrap().to_string())?;
             }
-            Err(e) => {
-                self.display.show_error(&format!("Transaction failed: {}", e))?;
+            result if result.error.is_some() => {
+                self.display.show_error(&format!("Transaction failed: {}", result.error.unwrap().to_string()))?;
+            }
+            _ => {
+                self.display.show_error("Transaction failed")?;
             }
         }
-
         self.wait_for_key().await?;
         Ok(())
     }

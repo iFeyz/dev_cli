@@ -898,10 +898,12 @@ version = "0.1.0"
 dependencies = [
  "alloy",
  "anyhow",
+ "async-trait",
  "atty",
  "colored",
  "crossterm",
  "dotenvy",
+ "hex",
  "rpassword",
  "serde_json",
  "tabled",

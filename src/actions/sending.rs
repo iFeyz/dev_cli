@@ -84,66 +84,6 @@ impl SendError {
     }
 }
 
-pub async fn send_eth(transaction_request: SendTransactionRequest) -> Result<TransactionInfo, SendError> {
-    
-    // Initialize a signer with a private key (Anvil's default account)
-    let signer: PrivateKeySigner = transaction_request.private_key;
-
-    // Instantiate a provider with the signer and a local anvil node
-    let provider = ProviderBuilder::new()
-        .wallet(signer)
-        .connect(&Config::load().unwrap().rpc_url.as_str())
-        .await
-        .map_err(|e| {
-            let message = format!("Failed to connect to provider: {}", e);
-            let code = map_error_to_code(&message);
-            SendError::new(message, code)
-        })?;
-
-    let url = "http://127.0.0.1:8545".parse().unwrap();
-    let provider_trace = ProviderBuilder::new().connect_http(
-        url
-    );
-
-    // Prepare a transaction request to send 1 ETH to Alice
-    let address = transaction_request.to;
-    let alice = address.parse().map_err(|e| SendError::new(format!("Invalid address: {}", e), 9))?;
-    let value = Unit::ETHER.wei().saturating_mul(transaction_request.value); // Sending 1 ETH
-    let tx = TransactionRequest::default()
-        .with_to(alice)
-        .with_value(value);
-
-    // If trace call is enabled and the RPC URL is not localhost, trace the call
-    //TODO REMOVE IT TO A PROPER FACTORY TRACE CALL FUNCTION 
-    if transaction_request.trace_call && !Config::load().unwrap().rpc_url.as_str().contains("localhost") {
-        let result = provider_trace.trace_call(&tx).await;
-        println!("{:?}", result);
-    }
-    // Send the transaction and wait for the broadcast
-    let pending_tx = provider
-        .send_transaction(tx)
-        .await
-        .map_err(|e| {
-            let message = format!("Failed to send transaction: {}", e);
-            let code = map_error_to_code(&message);
-            SendError::new(message, code)
-        })?;
-    
-    // Get the transaction hash before consuming pending_tx
-    let tx_hash = *pending_tx.tx_hash();
-    println!("Pending transaction... {}", tx_hash);
-
-
-    
-    // Créer TransactionInfo à partir du hash
-    let tx_info = TransactionInfo::from_hash(&provider, tx_hash)
-        .await
-        .map_err(|e| SendError::new(format!("Failed to get transaction info: {}", e), -1))?;
-
-    Ok(tx_info)
-}
-
-// Add a trace call function to use before any transaction to simulate it 
 
 // Fonction pour récupérer les infos d'une transaction existante
 pub async fn get_transaction_info(tx_hash: &str) -> Result<TransactionInfo, SendError> {
