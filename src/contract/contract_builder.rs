@@ -1,0 +1,246 @@
+use alloy::{
+    contract::{ContractInstance, Interface},
+    network::{Network, TransactionBuilder, Ethereum},
+    primitives::{Address, Bytes, U256},
+    providers::{Provider, ProviderBuilder},
+    rpc::types::TransactionRequest,
+    sol_types::SolConstructor,
+};
+use alloy::transports::http::reqwest::Url;
+use crate::config::simple_config::Config;
+use alloy::sol;
+use alloy::signers::local::PrivateKeySigner;
+use std::str::FromStr;
+
+
+use anyhow::Result;
+use std::marker::PhantomData;
+use std::sync::Arc;
+
+use crate::model::interaction::{Interaction, InteractionBuilder, RequestConfig, UserCredentials, ExecutionMode, RequestResult, RequestError, TraceInfo};
+
+// Generic builder for interact or deploy a contract
+
+sol!(
+    contract Token {
+        string public name;
+        string public symbol;
+        uint8 public decimals;
+        uint256 public totalSupply;
+        mapping(address => uint256) public balanceOf;
+        mapping(address => mapping(address => uint256)) public allowance;
+        
+        event Transfer(address indexed from, address indexed to, uint256 value);
+        event Approval(address indexed owner, address indexed spender, uint256 value);
+        
+        constructor(string memory _name, string memory _symbol, uint256 _supply) {
+            name = _name;
+            symbol = _symbol;
+            decimals = 18;
+            totalSupply = _supply * 10**uint256(decimals);
+            balanceOf[msg.sender] = totalSupply;
+        }
+        
+        function transfer(address to, uint256 amount) public returns (bool) {
+            require(balanceOf[msg.sender] >= amount, "Insufficient balance");
+            balanceOf[msg.sender] -= amount;
+            balanceOf[to] += amount;
+            emit Transfer(msg.sender, to, amount);
+            return true;
+        }
+        
+        function approve(address spender, uint256 amount) public returns (bool) {
+            allowance[msg.sender][spender] = amount;
+            emit Approval(msg.sender, spender, amount);
+            return true;
+        }
+        
+        function transferFrom(address from, address to, uint256 amount) public returns (bool) {
+            require(balanceOf[from] >= amount, "Insufficient balance");
+            require(allowance[from][msg.sender] >= amount, "Insufficient allowance");
+            
+            balanceOf[from] -= amount;
+            balanceOf[to] += amount;
+            allowance[from][msg.sender] -= amount;
+            
+            emit Transfer(from, to, amount);
+            return true;
+        }
+    }
+);
+
+pub struct ContractBuilder<T, P, N> 
+where 
+    P: Provider<N>,
+    N: Network,
+{
+    provider: P,
+    bytecode: Option<Bytes>,
+    constructor_args: Option<Bytes>,
+    config: RequestConfig,
+    credentials: Option<UserCredentials>,
+    execution_mode: ExecutionMode,
+    _phantom: PhantomData<(T, N)>,
+
+}
+
+impl<T, P, N> ContractBuilder<T, P, N>
+where 
+    P: Provider<N> + Clone,
+    N: Network,
+{
+    pub fn new(provider: P) -> Self {
+        Self {
+            provider,
+            bytecode: None,
+            constructor_args: None,
+            credentials: None,
+            config: RequestConfig::default(),
+            execution_mode: ExecutionMode::Direct,
+            _phantom: PhantomData,
+        }
+    }
+
+    // Build the methods
+
+    pub fn with_bytecode(mut self, bytecode: Bytes) -> Self {
+        self.bytecode = Some(bytecode);
+        self
+    }
+
+    pub fn with_constructor_args(mut self, args: Bytes) -> Self {
+        self.constructor_args = Some(args);
+        self
+    }
+
+    pub fn with_credentials(mut self, credentials: UserCredentials) -> Self {
+        self.credentials = Some(credentials);
+        self
+    }
+
+    pub fn with_config(mut self, config: RequestConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    pub fn with_execution_mode(mut self, mode: ExecutionMode) -> Self {
+        self.execution_mode = mode;
+        self
+    }
+
+    // Deploy the contract
+    // TODO : REPLACE ERROR BY CUSTOM CONTRACT ERROR
+    pub async fn deploy(self) -> RequestResult<DeployedContract<T, P, N>> {
+        let bytecode = match self.bytecode {
+            Some(b) => b,
+            None => return RequestResult::error(RequestError::MissingBytecode),
+        };
+
+        let credentials = match self.credentials {
+            Some(c) => c,
+            None => return RequestResult::error(RequestError::MissingCredentials),
+        };
+
+        let deploy_code = if let Some(args) = self.constructor_args {
+            let mut code = bytecode.to_vec();
+            code.extend_from_slice(&args);
+            Bytes::from(code)
+        } else {
+            bytecode
+        };
+
+        let interaction = Interaction::new(
+            Address::ZERO,
+            deploy_code,
+            "constructor".to_string(),
+            credentials,
+            Some(self.config),
+        )
+        .with_execution_mode(self.execution_mode);
+
+        println!("Ici");
+
+        let result = interaction.execute(&self.provider).await;
+
+        match result {
+            RequestResult {
+                success: true,
+                data: Some(data),
+                transaction_hash: Some(tx_hash),
+                trace_info,
+                ..
+            } => {
+                print!("Success deploy");
+                let tx_request = <N as Network>::TransactionRequest::default();
+                let contract_address = data.contract_address;
+                    
+                let deployed = DeployedContract {
+                    address: contract_address,
+                    provider: self.provider,
+                    deployment_tx_hash: tx_hash.clone(),
+                    trace_info: trace_info.clone(),
+                    _phantom: PhantomData,
+                };
+
+                RequestResult::success(deployed, Some(tx_hash), trace_info)
+
+
+            } 
+            RequestResult { success: false, error, trace_info, .. } => {
+                print!("Error {}",error.clone().unwrap());
+
+                RequestResult { 
+                    success: false, 
+                    error, 
+                    data: None, 
+                    transaction_hash: None, 
+                    trace_info 
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    
+}
+
+pub struct DeployedContract<T, P, N>
+where 
+    P: Provider<N>,
+    N: Network,
+{
+    pub address: Address,
+    pub provider: P,
+    pub deployment_tx_hash: String,
+    pub trace_info: Option<TraceInfo>,
+    _phantom: PhantomData<(T, N)>,
+}
+
+
+pub async fn test_contract_deployment()  {
+
+    let config = Config::load().unwrap();
+    let provider = ProviderBuilder::new().connect_http(config.rpc_url.parse::<Url>().unwrap());
+
+
+
+    let constructor_args = Token::constructorCall {
+        _name: "MyToken".to_string(),
+        _symbol: "MTK".to_string(),
+        _supply: U256::from(1000000),
+    }.abi_encode();
+
+    let credentials = UserCredentials::new(PrivateKeySigner::from_str("0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80").unwrap());
+
+    let bytescode =  Bytes::from(hex::decode("608060405234801561000f575f5ffd5b5060405161151938038061151983398181016040528101906100319190610266565b825f908161003f91906104f5565b50816001908161004f91906104f5565b50601260025f6101000a81548160ff021916908360ff16021790555060025f9054906101000a900460ff1660ff16600a6100899190610720565b81610094919061076a565b60038190555060035460045f3373ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020019081526020015f20819055505050506107ab565b5f604051905090565b5f5ffd5b5f5ffd5b5f5ffd5b5f5ffd5b5f601f19601f8301169050919050565b7f4e487b71000000000000000000000000000000000000000000000000000000005f52604160045260245ffd5b610145826100ff565b810181811067ffffffffffffffff821117156101645761016361010f565b5b80604052505050565b5f6101766100e6565b9050610182828261013c565b919050565b5f67ffffffffffffffff8211156101a1576101a061010f565b5b6101aa826100ff565b9050602081019050919050565b8281835e5f83830152505050565b5f6101d76101d284610187565b61016d565b9050828152602081018484840111156101f3576101f26100fb565b5b6101fe8482856101b7565b509392505050565b5f82601f83011261021a576102196100f7565b5b815161022a8482602086016101c5565b91505092915050565b5f819050919050565b61024581610233565b811461024f575f5ffd5b50565b5f815190506102608161023c565b92915050565b5f5f5f6060848603121561027d5761027c6100ef565b5b5f84015167ffffffffffffffff81111561029a576102996100f3565b5b6102a686828701610206565b935050602084015167ffffffffffffffff8111156102c7576102c66100f3565b5b6102d386828701610206565b92505060406102e486828701610252565b9150509250925092565b5f81519050919050565b7f4e487b71000000000000000000000000000000000000000000000000000000005f52602260045260245ffd5b5f600282049050600182168061033c57607f821691505b60208210810361034f5761034e6102f8565b5b50919050565b5f819050815f5260205f209050919050565b5f6020601f8301049050919050565b5f82821b905092915050565b5f600883026103b17fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff82610376565b6103bb8683610376565b95508019841693508086168417925050509392505050565b5f819050919050565b5f6103f66103f16103ec84610233565b6103d3565b610233565b9050919050565b5f819050919050565b61040f836103dc565b61042361041b826103fd565b848454610382565b825550505050565b5f5f905090565b61043a61042b565b610445818484610406565b505050565b5b818110156104685761045d5f82610432565b60018101905061044b565b5050565b601f8211156104ad5761047e81610355565b61048784610367565b81016020851015610496578190505b6104aa6104a285610367565b83018261044a565b50505b505050565b5f82821c905092915050565b5f6104cd5f19846008026104b2565b1980831691505092915050565b5f6104e583836104be565b9150826002028217905092915050565b6104fe826102ee565b67ffffffffffffffff8111156105175761051661010f565b5b6105218254610325565b61052c82828561046c565b5f60209050601f83116001811461055d575f841561054b578287015190505b61055585826104da565b8655506105bc565b601f19841661056b86610355565b5f5b828110156105925784890151825560018201915060208501945060208101905061056d565b868310156105af57848901516105ab601f8916826104be565b8355505b6001600288020188555050505b505050505050565b7f4e487b71000000000000000000000000000000000000000000000000000000005f52601160045260245ffd5b5f8160011c9050919050565b5f5f8291508390505b600185111561064657808604811115610622576106216105c4565b5b60018516156106315780820291505b808102905061063f856105f1565b9450610606565b94509492505050565b5f8261065e5760019050610719565b8161066b575f9050610719565b8160018114610681576002811461068b576106ba565b6001915050610719565b60ff84111561069d5761069c6105c4565b5b8360020a9150848211156106b4576106b36105c4565b5b50610719565b5060208310610133831016604e8410600b84101617156106ef5782820a9050838111156106ea576106e96105c4565b5b610719565b6106fc84848460016105fd565b92509050818404811115610713576107126105c4565b5b81810290505b9392505050565b5f61072a82610233565b915061073583610233565b92506107627fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff848461064f565b905092915050565b5f61077482610233565b915061077f83610233565b925082820261078d81610233565b915082820484148315176107a4576107a36105c4565b5b5092915050565b610d61806107b85f395ff3fe608060405234801561000f575f5ffd5b5060043610610091575f3560e01c8063313ce56711610064578063313ce5671461013157806370a082311461014f57806395d89b411461017f578063a9059cbb1461019d578063dd62ed3e146101cd57610091565b806306fdde0314610095578063095ea7b3146100b357806318160ddd146100e357806323b872dd14610101575b5f5ffd5b61009d6101fd565b6040516100aa9190610934565b60405180910390f35b6100cd60048036038101906100c891906109e5565b610288565b6040516100da9190610a3d565b60405180910390f35b6100eb610375565b6040516100f89190610a65565b60405180910390f35b61011b60048036038101906101169190610a7e565b61037b565b6040516101289190610a3d565b60405180910390f35b61013961065b565b6040516101469190610ae9565b60405180910390f35b61016960048036038101906101649190610b02565b61066d565b6040516101769190610a65565b60405180910390f35b610187610682565b6040516101949190610934565b60405180910390f35b6101b760048036038101906101b291906109e5565b61070e565b6040516101c49190610a3d565b60405180910390f35b6101e760048036038101906101e29190610b2d565b6108a4565b6040516101f49190610a65565b60405180910390f35b5f805461020990610b98565b80601f016020809104026020016040519081016040528092919081815260200182805461023590610b98565b80156102805780601f1061025757610100808354040283529160200191610280565b820191905f5260205f20905b81548152906001019060200180831161026357829003601f168201915b505050505081565b5f8160055f3373ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020019081526020015f205f8573ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020019081526020015f20819055508273ffffffffffffffffffffffffffffffffffffffff163373ffffffffffffffffffffffffffffffffffffffff167f8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925846040516103639190610a65565b60405180910390a36001905092915050565b60035481565b5f8160045f8673ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020019081526020015f205410156103fc576040517f08c379a00000000000000000000000000000000000000000000000000000000081526004016103f390610c12565b60405180910390fd5b8160055f8673ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020019081526020015f205f3373ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020019081526020015f205410156104b7576040517f08c379a00000000000000000000000000000000000000000000000000000000081526004016104ae90610c7a565b60405180910390fd5b8160045f8673ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020019081526020015f205f8282546105039190610cc5565b925050819055508160045f8573ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020019081526020015f205f8282546105569190610cf8565b925050819055508160055f8673ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020019081526020015f205f3373ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020019081526020015f205f8282546105e49190610cc5565b925050819055508273ffffffffffffffffffffffffffffffffffffffff168473ffffffffffffffffffffffffffffffffffffffff167fddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef846040516106489190610a65565b60405180910390a3600190509392505050565b60025f9054906101000a900460ff1681565b6004602052805f5260405f205f915090505481565b6001805461068f90610b98565b80601f01602080910402602001604051908101604052809291908181526020018280546106bb90610b98565b80156107065780601f106106dd57610100808354040283529160200191610706565b820191905f5260205f20905b8154815290600101906020018083116106e957829003601f168201915b505050505081565b5f8160045f3373ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020019081526020015f2054101561078f576040517f08c379a000000000000000000000000000000000000000000000000000000000815260040161078690610c12565b60405180910390fd5b8160045f3373ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020019081526020015f205f8282546107db9190610cc5565b925050819055508160045f8573ffffffffffffffffffffffffffffffffffffffff1673ffffffffffffffffffffffffffffffffffffffff1681526020019081526020015f205f82825461082e9190610cf8565b925050819055508273ffffffffffffffffffffffffffffffffffffffff163373ffffffffffffffffffffffffffffffffffffffff167fddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef846040516108929190610a65565b60405180910390a36001905092915050565b6005602052815f5260405f20602052805f5260405f205f91509150505481565b5f81519050919050565b5f82825260208201905092915050565b8281835e5f83830152505050565b5f601f19601f8301169050919050565b5f610906826108c4565b61091081856108ce565b93506109208185602086016108de565b610929816108ec565b840191505092915050565b5f6020820190508181035f83015261094c81846108fc565b905092915050565b5f5ffd5b5f73ffffffffffffffffffffffffffffffffffffffff82169050919050565b5f61098182610958565b9050919050565b61099181610977565b811461099b575f5ffd5b50565b5f813590506109ac81610988565b92915050565b5f819050919050565b6109c4816109b2565b81146109ce575f5ffd5b50565b5f813590506109df816109bb565b92915050565b5f5f604083850312156109fb576109fa610954565b5b5f610a088582860161099e565b9250506020610a19858286016109d1565b9150509250929050565b5f8115159050919050565b610a3781610a23565b82525050565b5f602082019050610a505f830184610a2e565b92915050565b610a5f816109b2565b82525050565b5f602082019050610a785f830184610a56565b92915050565b5f5f5f60608486031215610a9557610a94610954565b5b5f610aa28682870161099e565b9350506020610ab38682870161099e565b9250506040610ac4868287016109d1565b9150509250925092565b5f60ff82169050919050565b610ae381610ace565b82525050565b5f602082019050610afc5f830184610ada565b92915050565b5f60208284031215610b1757610b16610954565b5b5f610b248482850161099e565b91505092915050565b5f5f60408385031215610b4357610b42610954565b5b5f610b508582860161099e565b9250506020610b618582860161099e565b9150509250929050565b7f4e487b71000000000000000000000000000000000000000000000000000000005f52602260045260245ffd5b5f6002820490506001821680610baf57607f821691505b602082108103610bc257610bc1610b6b565b5b50919050565b7f496e73756666696369656e742062616c616e63650000000000000000000000005f82015250565b5f610bfc6014836108ce565b9150610c0782610bc8565b602082019050919050565b5f6020820190508181035f830152610c2981610bf0565b9050919050565b7f496e73756666696369656e7420616c6c6f77616e6365000000000000000000005f82015250565b5f610c646016836108ce565b9150610c6f82610c30565b602082019050919050565b5f6020820190508181035f830152610c9181610c58565b9050919050565b7f4e487b71000000000000000000000000000000000000000000000000000000005f52601160045260245ffd5b5f610ccf826109b2565b9150610cda836109b2565b9250828203905081811115610cf257610cf1610c98565b5b92915050565b5f610d02826109b2565b9150610d0d836109b2565b9250828201905080821115610d2557610d24610c98565b5b9291505056fea26469706673582212209e3f0e864ba12c8828ca483e27c02af0a33db91a0531db1bcb2dcda9364896d764736f6c634300081e0033").unwrap());
+
+    let builder: ContractBuilder<String, _, _> = ContractBuilder::new(provider)
+        .with_bytecode(bytescode)
+        .with_constructor_args(constructor_args.into())
+        .with_credentials(credentials)
+        .with_config(RequestConfig::default())
+        .with_execution_mode(ExecutionMode::Direct);
+    let deployed = builder.deploy().await;
+
+    println!("Deployed contract: {:?}", deployed.transaction_hash);
+}

@@ -10,7 +10,7 @@ use std::str::FromStr;
 
 // Import your modules
 use crate::config::Config;
-use crate::model::interaction::{Transaction, UserCredentials, RequestConfig, Requestable};
+use crate::model::interaction::{Transaction, UserCredentials, RequestConfig};
 
 pub struct TransactionExample {
     config: Config,
@@ -86,7 +86,7 @@ impl TransactionExample {
 
         // Execute the transaction with tracing
         println!("\n🔄 Executing transaction...");
-        let result = transaction.trace_and_execute(&provider).await;
+        let result = transaction.execute(&provider).await;
 
         match result {
             result if result.success => {
@@ -205,7 +205,7 @@ impl TransactionExample {
         println!("💰 Amount: {}", token_amount);
 
         // Execute the transaction
-        let result = transaction.trace_and_execute(&provider).await;
+        let result = transaction.execute(&provider).await;
 
         match result {
             result if result.success => {

@@ -9,8 +9,9 @@ use alloy::{
 use async_trait::async_trait;
 use std::error::Error as StdError;
 use std::fmt;
+use std::marker::PhantomData;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum RequestError {
     NetworkError(String),
     InsufficientFunds,
@@ -19,6 +20,9 @@ pub enum RequestError {
     SigningError(String),
     TraceError(String),
     SimulationFailed(String),
+    TraceNotSupported,
+    MissingBytecode,
+    MissingCredentials,
 }
 
 impl fmt::Display for RequestError {
@@ -31,6 +35,9 @@ impl fmt::Display for RequestError {
             RequestError::SigningError(msg) => write!(f, "Signing error: {}", msg),
             RequestError::TraceError(msg) => write!(f, "Trace error: {}", msg),
             RequestError::SimulationFailed(msg) => write!(f, "Simulation failed: {}", msg),
+            RequestError::TraceNotSupported => write!(f, "Trace not supported on this network"),
+            RequestError::MissingBytecode => write!(f, "Bytecode is missing"),
+            RequestError::MissingCredentials => write!(f, "Credentials are missing"),
         }
     }
 }
@@ -56,36 +63,22 @@ impl TraceInfo {
         let mut error = None;
         let logs_count = 0;
 
-        // Process trace results - TraceResults from parity trace API
-        // results.trace is a Vec<TransactionTrace>, not Option<Vec<TransactionTrace>>
         for trace_item in &results.trace {
             calls.push(format!("{:?}", trace_item));
             
-            // Extract gas usage if available
             if let Some(result) = &trace_item.result {
                 let gas = result.gas_used();
                 gas_used = U256::from(gas);
-                
-                // Get return value if available
                 let output = result.output();
                 return_value = Some(output.clone());
             }
             
-            
-            // Check for execution errors in the trace
             if let Some(ref trace_error) = trace_item.error {
                 success = false;
                 error = Some(trace_error.clone());
             }
         }
 
-        // Check vm_trace for additional information if available
-        if let Some(ref _vm_trace) = results.vm_trace {
-            // VM trace processing can be added here if needed
-        }
-
-        // results.output is a Bytes, not Option<Bytes>
-        // Use it as return value if we haven't found one yet
         if return_value.is_none() {
             return_value = Some(results.output.clone());
         }
@@ -111,7 +104,7 @@ pub struct RequestConfig {
 impl Default for RequestConfig {
     fn default() -> Self {
         Self {
-            gas_limit: U256::from(21_000),
+            gas_limit: U256::from(300_000),
             gas_price: U256::from(20_000_000_000u64), 
             nonce: None,
         }
@@ -183,60 +176,18 @@ impl<T> RequestResult<T> {
     }
 }
 
-#[async_trait]
-pub trait Requestable<T> {
-    async fn request<P>(&self, provider: &P) -> RequestResult<T>
-    where
-        P: Provider<Ethereum> + TraceApi<Ethereum> + Send + Sync ;
-    
-    fn validate(&self) -> Result<(), RequestError>;
-    
-    fn build_transaction_request(&self) -> TransactionRequest;
-    
-    async fn trace_and_execute<P>(&self, provider: &P) -> RequestResult<T> 
-    where
-        P: Provider<Ethereum> + TraceApi<Ethereum> + Send + Sync ,
-    {
-        if let Err(e) = self.validate() {
-            return RequestResult::error(e);
-        }
-
-        let tx_request = self.build_transaction_request();
-
-        println!("🔍 Simulating transaction...");
-        
-        // Use the correct Alloy tracing method with proper types
-        let trace_result = match provider.trace_call(&tx_request).await {
-            Ok(result) => result,
-            Err(e) => {
-                return RequestResult::error(RequestError::TraceError(e.to_string()));
-            }
-        };
-
-        let trace_info = TraceInfo::from_trace_results(&trace_result);
-        
-        println!("📊 Simulation results:");
-        println!("  - Gas estimated: {}", trace_info.gas_used);
-        println!("  - Success: {}", trace_info.success);
-        println!("  - Function calls: {}", trace_info.calls.len());
-        println!("  - Logs generated: {}", trace_info.logs_count);
-
-        if !trace_info.success {
-            let error_msg = trace_info.error
-                .clone()
-                .unwrap_or_else(|| "Transaction would fail".to_string());
-            return RequestResult::simulation_failed(trace_info, error_msg);
-        }
-
-        println!("✅ Simulation successful, executing transaction...");
-        let mut result = self.request(provider).await;
-        
-        // Update trace info in result
-        result.trace_info = Some(trace_info);
-
-        result
-    }
+/// Modes d'exécution pour les interactions
+#[derive(Debug, Clone, Copy)]
+pub enum ExecutionMode {
+    /// Exécuter directement sans traçage
+    Direct,
+    /// Tracer seulement (simulation)
+    TraceOnly,
+    /// Tracer puis exécuter si succès
+    TraceAndExecute,
 }
+
+// ============= TRANSACTION (pour les transferts wallet-à-wallet) =============
 
 #[derive(Debug)]
 pub struct TransactionData {
@@ -245,15 +196,17 @@ pub struct TransactionData {
     pub gas_used: U256,
 }
 
-pub struct Transaction {
+pub struct Transaction<N: Network> {
     pub to: Address,
     pub value: U256,
     pub data: Option<Bytes>, 
     pub config: RequestConfig,
     pub user_credentials: UserCredentials,
+    pub execution_mode: ExecutionMode,
+    _phantom: PhantomData<N>,
 }
 
-impl Transaction {
+impl<N: Network> Transaction<N> {
     pub fn new_eth_transfer(
         to: Address,
         value: U256,
@@ -266,6 +219,8 @@ impl Transaction {
             data: None,
             config: config.unwrap_or_default(),
             user_credentials: credentials,
+            execution_mode: ExecutionMode::Direct,
+            _phantom: PhantomData,
         }
     }
 
@@ -289,33 +244,65 @@ impl Transaction {
             data: Some(Bytes::from(hex::decode(&transfer_call).unwrap())),
             config: config.unwrap_or_default(),
             user_credentials: credentials,
+            execution_mode: ExecutionMode::Direct,
+            _phantom: PhantomData,
         }
     }
-}
 
-#[async_trait]
-impl Requestable<TransactionData> for Transaction {
-    fn build_transaction_request(&self) -> TransactionRequest {
-        TransactionRequest::default()
+    pub fn with_execution_mode(mut self, mode: ExecutionMode) -> Self {
+        self.execution_mode = mode;
+        self
+    }
+
+    fn build_transaction_request(&self) -> <N as Network>::TransactionRequest {
+        let mut tx = <N as Network>::TransactionRequest::default()
             .with_from(self.user_credentials.address())
             .with_to(self.to)
             .with_value(self.value)
             .with_gas_limit(self.config.gas_limit.to::<u64>())
-            .with_gas_price(self.config.gas_price.to::<u128>())
-            .with_input(self.data.clone().unwrap_or_default())
+            .with_gas_price(self.config.gas_price.to::<u128>());
+
+        if let Some(ref data) = self.data {
+            tx = tx.with_input(data.clone());
+        }
+        tx
     }
 
-    async fn request<P>(&self, provider: &P) -> RequestResult<TransactionData>
+    fn validate(&self) -> Result<(), RequestError> {
+        if self.to == Address::ZERO {
+            return Err(RequestError::InvalidAddress);
+        }
+        if self.config.gas_limit == U256::ZERO {
+            return Err(RequestError::NetworkError("Gas limit cannot be zero".to_string()));
+        }
+        Ok(())
+    }
+
+    pub async fn execute<P>(&self, provider: &P) -> RequestResult<TransactionData>
     where
-        P: Provider<Ethereum> + TraceApi<Ethereum> + Send + Sync ,
+        P: Provider<N> + Send + Sync,
     {
+        match self.execution_mode {
+            ExecutionMode::Direct => self.execute_direct(provider).await,
+            ExecutionMode::TraceOnly => self.trace_only(provider).await,
+            ExecutionMode::TraceAndExecute => self.trace_and_execute(provider).await,
+        }
+    }
+
+    async fn execute_direct<P>(&self, provider: &P) -> RequestResult<TransactionData>
+    where
+        P: Provider<N> + Send + Sync,
+    {
+        if let Err(e) = self.validate() {
+            return RequestResult::error(e);
+        }
+
         let tx_request = self.build_transaction_request();
 
         match provider.send_transaction(tx_request).await {
             Ok(pending_tx) => {
                 let tx_hash = format!("{:?}", pending_tx.tx_hash());
                 
-                // Use get_receipt() to get the receipt
                 match pending_tx.get_receipt().await {
                     Ok(receipt) => {
                         let data = TransactionData {
@@ -332,16 +319,24 @@ impl Requestable<TransactionData> for Transaction {
         }
     }
 
-    fn validate(&self) -> Result<(), RequestError> {
-        if self.to == Address::ZERO {
-            return Err(RequestError::InvalidAddress);
-        }
-        if self.config.gas_limit == U256::ZERO {
-            return Err(RequestError::NetworkError("Gas limit cannot be zero".to_string()));
-        }
-        Ok(())
+    async fn trace_only<P>(&self, provider: &P) -> RequestResult<TransactionData>
+    where
+        P: Provider<N> + Send + Sync,
+    {
+        // Similaire à Interaction mais pour Transaction
+        RequestResult::error(RequestError::TraceNotSupported)
+    }
+
+    async fn trace_and_execute<P>(&self, provider: &P) -> RequestResult<TransactionData>
+    where
+        P: Provider<N> + Send + Sync,
+    {
+        // Pour l'instant, exécuter directement
+        self.execute_direct(provider).await
     }
 }
+
+// ============= INTERACTION (pour les smart contracts) =============
 
 #[derive(Debug)]
 pub struct InteractionData {
@@ -351,16 +346,18 @@ pub struct InteractionData {
     pub gas_used: U256,
 }
 
-pub struct Interaction {
+pub struct Interaction<N: Network = Ethereum> {
     pub contract_address: Address,
-    pub function_data: Bytes, 
+    pub function_data: Bytes,
     pub function_name: String,
-    pub value: U256, 
+    pub value: U256,
     pub config: RequestConfig,
     pub user_credentials: UserCredentials,
+    pub execution_mode: ExecutionMode,
+    _phantom: PhantomData<N>,
 }
 
-impl Interaction {
+impl<N: Network> Interaction<N> {
     pub fn new(
         contract_address: Address,
         function_data: Bytes,
@@ -375,6 +372,8 @@ impl Interaction {
             value: U256::ZERO,
             config: config.unwrap_or_default(),
             user_credentials: credentials,
+            execution_mode: ExecutionMode::Direct,
+            _phantom: PhantomData,
         }
     }
 
@@ -382,12 +381,14 @@ impl Interaction {
         self.value = value;
         self
     }
-}
 
-#[async_trait]
-impl Requestable<InteractionData> for Interaction {
-    fn build_transaction_request(&self) -> TransactionRequest {
-        TransactionRequest::default()
+    pub fn with_execution_mode(mut self, mode: ExecutionMode) -> Self {
+        self.execution_mode = mode;
+        self
+    }
+
+    fn build_transaction_request(&self) -> <N as Network>::TransactionRequest {
+        <N as Network>::TransactionRequest::default()
             .with_from(self.user_credentials.address())
             .with_to(self.contract_address)
             .with_value(self.value)
@@ -396,29 +397,58 @@ impl Requestable<InteractionData> for Interaction {
             .with_gas_price(self.config.gas_price.to::<u128>())
     }
 
-    async fn request<P>(&self, provider: &P) -> RequestResult<InteractionData>
+    fn validate(&self) -> Result<(), RequestError> {
+  
+        if self.function_data.is_empty() {
+            return Err(RequestError::ContractError("Function data cannot be empty".to_string()));
+        }
+        Ok(())
+    }
+
+    pub async fn execute<P>(&self, provider: &P) -> RequestResult<InteractionData>
     where
-        P: Provider<Ethereum> + TraceApi<Ethereum> + Send + Sync ,
+        P: Provider<N> + Send + Sync,
     {
+        match self.execution_mode {
+            ExecutionMode::Direct => self.execute_direct(provider).await,
+            ExecutionMode::TraceOnly => self.trace_only(provider).await,
+            ExecutionMode::TraceAndExecute => self.trace_and_execute(provider).await,
+        }
+    }
+
+    async fn execute_direct<P>(&self, provider: &P) -> RequestResult<InteractionData>
+    where
+        P: Provider<N> + Send + Sync,
+    {
+        if let Err(e) = self.validate() {
+            return RequestResult::error(e);
+        }
+
+        println!("🚀 Executing contract interaction directly...");
         let tx_request = self.build_transaction_request();
 
         match provider.send_transaction(tx_request).await {
             Ok(pending_tx) => {
                 let tx_hash = format!("{:?}", pending_tx.tx_hash());
+                println!("📝 Transaction sent: {}", tx_hash);
                 
-                // Use get_receipt() to get the receipt
                 match pending_tx.get_receipt().await {
                     Ok(receipt) => {
                         let data = InteractionData {
                             contract_address: self.contract_address,
                             function_called: self.function_name.clone(),
-                            return_data: receipt.inner
-                                .logs()
-                                .first()
-                                .map(|log| log.data().data.clone())
-                                .unwrap_or_default(),
+                            return_data: Bytes::new(),
+                            //return_data: receipt
+                            //    .logs()
+                            //    .first()
+                            //    .map(|log| log.data().data.clone())
+                            //    .unwrap_or_default(),
                             gas_used: U256::from(receipt.gas_used()),
                         };
+                        
+                        println!("✅ Transaction confirmed");
+                        println!("⛽ Gas used: {}", data.gas_used);
+                        
                         RequestResult::success(data, Some(tx_hash), None)
                     }
                     Err(e) => RequestResult::error(RequestError::ContractError(e.to_string())),
@@ -428,13 +458,149 @@ impl Requestable<InteractionData> for Interaction {
         }
     }
 
-    fn validate(&self) -> Result<(), RequestError> {
-        if self.contract_address == Address::ZERO {
-            return Err(RequestError::InvalidAddress);
+    async fn trace_only<P>(&self, provider: &P) -> RequestResult<InteractionData>
+    where
+        P: Provider<N> + Send + Sync,
+    {
+        if let Err(e) = self.validate() {
+            return RequestResult::error(e);
         }
-        if self.function_data.is_empty() {
-            return Err(RequestError::ContractError("Function data cannot be empty".to_string()));
+
+        println!("🔍 Simulating contract interaction...");
+
+        // Pour l'instant, utiliser l'estimation de gas comme fallback
+        self.estimate_gas_fallback(provider).await
+    }
+
+    async fn trace_and_execute<P>(&self, provider: &P) -> RequestResult<InteractionData>
+    where
+        P: Provider<N> + Send + Sync,
+    {
+        let trace_result = self.trace_only(provider).await;
+        
+        match trace_result {
+            RequestResult { success: true, trace_info, .. } => {
+                println!("✅ Simulation successful, executing transaction...");
+                
+                let mut execution_result = self.execute_direct(provider).await;
+                execution_result.trace_info = trace_info;
+                execution_result
+            }
+            result => result,
         }
-        Ok(())
+    }
+
+    async fn estimate_gas_fallback<P>(&self, provider: &P) -> RequestResult<InteractionData>
+    where
+        P: Provider<N> + Send + Sync,
+    {
+        let tx_request = self.build_transaction_request();
+        
+        match provider.estimate_gas(tx_request).await {
+            Ok(gas_estimate) => {
+                println!("⛽ Estimated gas: {}", gas_estimate);
+                
+                let trace_info = TraceInfo {
+                    gas_used: U256::from(gas_estimate),
+                    success: true,
+                    return_value: None,
+                    error: None,
+                    calls: vec!["Gas estimation only".to_string()],
+                    logs_count: 0,
+                };
+                
+                let data = InteractionData {
+                    contract_address: self.contract_address,
+                    function_called: self.function_name.clone(),
+                    return_data: Bytes::new(),
+                    gas_used: U256::from(gas_estimate),
+                };
+                
+                RequestResult::success(data, None, Some(trace_info))
+            }
+            Err(e) => RequestResult::error(RequestError::NetworkError(
+                format!("Gas estimation failed: {}", e)
+            )),
+        }
+    }
+}
+
+// Builder pour Interaction
+pub struct InteractionBuilder<N: Network = Ethereum> {
+    contract_address: Option<Address>,
+    function_data: Option<Bytes>,
+    function_name: Option<String>,
+    value: U256,
+    config: RequestConfig,
+    credentials: Option<UserCredentials>,
+    execution_mode: ExecutionMode,
+    _phantom: PhantomData<N>,
+}
+
+impl<N: Network> InteractionBuilder<N> {
+    pub fn new() -> Self {
+        Self {
+            contract_address: None,
+            function_data: None,
+            function_name: None,
+            value: U256::ZERO,
+            config: RequestConfig::default(),
+            credentials: None,
+            execution_mode: ExecutionMode::Direct,
+            _phantom: PhantomData,
+        }
+    }
+
+    pub fn with_contract(mut self, address: Address) -> Self {
+        self.contract_address = Some(address);
+        self
+    }
+
+    pub fn with_function(mut self, name: String, data: Bytes) -> Self {
+        self.function_name = Some(name);
+        self.function_data = Some(data);
+        self
+    }
+
+    pub fn with_value(mut self, value: U256) -> Self {
+        self.value = value;
+        self
+    }
+
+    pub fn with_credentials(mut self, credentials: UserCredentials) -> Self {
+        self.credentials = Some(credentials);
+        self
+    }
+
+    pub fn with_config(mut self, config: RequestConfig) -> Self {
+        self.config = config;
+        self
+    }
+
+    pub fn with_execution_mode(mut self, mode: ExecutionMode) -> Self {
+        self.execution_mode = mode;
+        self
+    }
+
+    pub fn build(self) -> Result<Interaction<N>, RequestError> {
+        let contract_address = self.contract_address
+            .ok_or(RequestError::InvalidAddress)?;
+        let function_data = self.function_data
+            .ok_or(RequestError::ContractError("Function data not set".to_string()))?;
+        let function_name = self.function_name
+            .ok_or(RequestError::ContractError("Function name not set".to_string()))?;
+        let credentials = self.credentials
+            .ok_or(RequestError::SigningError("Credentials not set".to_string()))?;
+
+        Ok(Interaction {
+            contract_address,
+            function_data,
+            function_name,
+            value: self.value,
+            config: self.config,
+            user_credentials: credentials,
+            execution_mode: self.execution_mode,
+            _phantom: PhantomData,
+        })
     }
 }

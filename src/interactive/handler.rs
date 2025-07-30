@@ -10,7 +10,7 @@ use alloy::transports::http::reqwest::Url;
 
 
 use crate::config::simple_config::Config;
-use crate::model::interaction::{Transaction, UserCredentials, RequestConfig, Requestable, RequestResult, TransactionData};
+use crate::model::interaction::{Transaction, UserCredentials, RequestConfig, RequestResult, TransactionData};
 
 pub struct MenuHandlers;
 
@@ -33,7 +33,7 @@ impl MenuHandlers {
             Some(RequestConfig::default()),
         );
         //Get a config provider
-        let result = transaction.trace_and_execute(&provider).await;
+        let result = transaction.execute(&provider).await;
         result
     }
 
@@ -46,7 +46,7 @@ impl MenuHandlers {
             UserCredentials::new(_private_key.parse::<PrivateKeySigner>().unwrap()),
             Some(RequestConfig::default()),
         );
-        let result = transaction.request(&provider).await;
+        let result = transaction.execute(&provider).await;
         result
     }
 
