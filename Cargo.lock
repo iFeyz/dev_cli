@@ -897,6 +897,8 @@ name = "alloy_01"
 version = "0.1.0"
 dependencies = [
  "alloy",
+ "alloy-json-abi",
+ "alloy-sol-types",
  "anyhow",
  "async-trait",
  "atty",
@@ -905,6 +907,7 @@ dependencies = [
  "dotenvy",
  "hex",
  "rpassword",
+ "serde",
  "serde_json",
  "tabled",
  "terminal_size",

@@ -3,7 +3,8 @@ pub mod actions;
 pub mod interactive;
 pub mod config;
 pub mod model;
-pub mod contract;
+pub mod contract;   
+pub mod examples;
 
 // Re-exports pour faciliter l'usage externe
 pub use actions::{

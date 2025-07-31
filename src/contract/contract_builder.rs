@@ -10,14 +10,14 @@ use alloy::transports::http::reqwest::Url;
 use crate::config::simple_config::Config;
 use alloy::sol;
 use alloy::signers::local::PrivateKeySigner;
-use std::str::FromStr;
+use std::{f64::consts::E, str::FromStr};
+use std::sync::Arc;
 
 
 use anyhow::Result;
 use std::marker::PhantomData;
-use std::sync::Arc;
 
-use crate::model::interaction::{Interaction, InteractionBuilder, RequestConfig, UserCredentials, ExecutionMode, RequestResult, RequestError, TraceInfo};
+use crate::model::interaction::{Interaction,InteractionData, InteractionBuilder, RequestConfig, UserCredentials, ExecutionMode, RequestResult, RequestError, TraceInfo};
 
 // Generic builder for interact or deploy a contract
 
@@ -74,7 +74,7 @@ where
     P: Provider<N>,
     N: Network,
 {
-    provider: P,
+    provider: Arc<P>,
     bytecode: Option<Bytes>,
     constructor_args: Option<Bytes>,
     config: RequestConfig,
@@ -89,7 +89,7 @@ where
     P: Provider<N> + Clone,
     N: Network,
 {
-    pub fn new(provider: P) -> Self {
+    pub fn new(provider: Arc<P>) -> Self {
         Self {
             provider,
             bytecode: None,
@@ -178,7 +178,7 @@ where
                     address: contract_address,
                     provider: self.provider,
                     deployment_tx_hash: tx_hash.clone(),
-                    trace_info: trace_info.clone(),
+                    gas_used: data.gas_used,
                     _phantom: PhantomData,
                 };
 
@@ -200,27 +200,250 @@ where
             _ => unreachable!(),
         }
     }
-
-    
 }
 
-pub struct DeployedContract<T, P, N>
-where 
+
+pub struct DeployedContract<T, P, N = Ethereum>
+where
     P: Provider<N>,
     N: Network,
 {
     pub address: Address,
-    pub provider: P,
+    pub provider: Arc<P>,
     pub deployment_tx_hash: String,
-    pub trace_info: Option<TraceInfo>,
+    pub gas_used: U256,
     _phantom: PhantomData<(T, N)>,
 }
+
+impl<T, P, N> DeployedContract<T, P, N>
+where
+    P: Provider<N> + Send + Sync,
+    N: Network,
+{
+    /// Obtenir l'adresse du contrat
+    pub fn address(&self) -> Address {
+        self.address
+    }
+
+    /// Obtenir le hash de la transaction de déploiement
+    pub fn deployment_tx_hash(&self) -> &str {
+        &self.deployment_tx_hash
+    }
+
+    /// Créer une instance de contrat pour interagir avec
+    pub fn instance(self, abi: Interface) -> ContractInstanceWrapper<P, N> {
+        ContractInstanceWrapper {
+            inner: ContractInstance::new(self.address, self.provider.clone(), abi),
+            address: self.address,
+            provider: self.provider,
+        }
+    }
+}
+
+
+
+pub struct ContractInstanceWrapper<P, N = Ethereum>
+where
+    P: Provider<N>,
+    N: Network,
+{
+    pub inner: ContractInstance<Arc<P>, N>,
+    pub address: Address,
+    pub provider: Arc<P>,
+}
+
+impl<P, N> ContractInstanceWrapper<P, N>
+where
+    P: Provider<N> + Send + Sync,
+    N: Network,
+{
+    /// Créer un nouveau wrapper
+    pub fn new(address: Address, provider: Arc<P>, abi: Interface) -> Self {
+        Self {
+            inner: ContractInstance::new(address, provider.clone(), abi),
+            address,
+            provider,
+        }
+    }
+
+    /// Appeler une fonction du contrat avec le système Interaction
+    pub async fn call_function(
+        &self,
+        function_name: &str,
+        function_data: Bytes,
+        credentials: UserCredentials,
+        config: Option<RequestConfig>,
+        mode: ExecutionMode,
+    ) -> RequestResult<InteractionData> {
+        let interaction = Interaction::new(
+            self.address,
+            function_data,
+            function_name.to_string(),
+            credentials,
+            config,
+        )
+        .with_execution_mode(mode);
+
+        interaction.execute(&*self.provider).await
+    }
+
+    /// Appeler une fonction payable
+    pub async fn call_function_payable(
+        &self,
+        function_name: &str,
+        function_data: Bytes,
+        value: U256,
+        credentials: UserCredentials,
+        config: Option<RequestConfig>,
+        mode: ExecutionMode,
+    ) -> RequestResult<InteractionData> {
+        let interaction = Interaction::new(
+            self.address,
+            function_data,
+            function_name.to_string(),
+            credentials,
+            config,
+        )
+        .with_value(value)
+        .with_execution_mode(mode);
+
+        interaction.execute(&*self.provider).await
+    }
+
+    pub fn address(&self) -> Address {
+        self.address
+    }
+
+    pub fn inner(&self) -> &ContractInstance<Arc<P>, N> {
+        &self.inner
+    }
+}
+
+
+pub struct ContractRegistry<P, N = Ethereum>
+where
+    P: Provider<N>,
+    N: Network,
+{
+    provider: Arc<P>,
+    contracts: std::collections::HashMap<String, ContractEntry>,
+    default_credentials: Option<UserCredentials>,
+    default_config: RequestConfig,
+    _phantom: PhantomData<N>,
+}
+
+pub struct ContractEntry {
+    pub address: Address,
+    pub abi: Interface,
+    pub deployment_info: Option<DeploymentInfo>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeploymentInfo {
+    pub tx_hash: String,
+    pub block_number: u64,
+    pub gas_used: U256,
+}
+
+impl<P, N> ContractRegistry<P, N>
+where
+    P: Provider<N> + Send + Sync,
+    N: Network,
+{
+    pub fn new(provider: P) -> Self {
+        Self {
+            provider: Arc::new(provider),
+            contracts: std::collections::HashMap::new(),
+            default_credentials: None,
+            default_config: RequestConfig::default(),
+            _phantom: PhantomData,
+        }
+    }
+
+    pub fn with_default_credentials(mut self, credentials: UserCredentials) -> Self {
+        self.default_credentials = Some(credentials);
+        self
+    }
+
+    pub fn with_default_config(mut self, config: RequestConfig) -> Self {
+        self.default_config = config;
+        self
+    }
+
+    pub fn register(&mut self, name: String, address: Address, abi: Interface, deployment_info: Option<DeploymentInfo>) {
+        self.contracts.insert(name, ContractEntry {
+            address,
+            abi,
+            deployment_info,
+        });
+    }
+
+    pub fn get(&self, name: &str) -> Option<&ContractEntry> {
+        self.contracts.get(name)
+    }
+
+    pub fn get_instance(&self, name: &str) -> Option<ContractInstanceWrapper<P, N>> {
+        self.get(name).map(|entry| {
+            ContractInstanceWrapper::new(
+                entry.address,
+                self.provider.clone(),
+                entry.abi.clone(),
+            )
+        })
+    }
+
+    pub async fn interact(
+        &self,
+        contract_name: &str,
+        contract_function: &str,
+        function_data: Bytes,
+        credentials: Option<UserCredentials>,
+        config: Option<RequestConfig>,
+        mode: ExecutionMode,
+    ) -> RequestResult<InteractionData> {
+        
+        let entry = match self.contracts.get(contract_name) {
+            Some(e) => e,
+            None => return RequestResult::error(
+                RequestError::ContractError(format!("Contract '{}' not found", contract_name))
+            ),
+        };
+
+        let creds = match credentials.or(self.default_credentials.clone()) {
+            Some(c) => c,
+            None => return RequestResult::error(
+                RequestError::SigningError("No credentials provided".to_string())
+            ),
+        };
+
+        let interaction = Interaction::new(
+            entry.address,
+            function_data,
+            contract_function.to_string(),
+            creds,
+            Some(config.unwrap_or(self.default_config.clone())),
+        )
+        .with_execution_mode(mode);
+
+        interaction.execute(&self.provider).await
+    }
+
+    //TODO ADD DEPLOY AND REGISTER CONTRACTS
+
+
+
+}
+
+
+    
+
+
 
 
 pub async fn test_contract_deployment()  {
 
     let config = Config::load().unwrap();
-    let provider = ProviderBuilder::new().connect_http(config.rpc_url.parse::<Url>().unwrap());
+    let provider = Arc::new(ProviderBuilder::new().connect_http(config.rpc_url.parse::<Url>().unwrap()));
 
 
 
