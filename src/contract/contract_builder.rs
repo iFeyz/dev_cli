@@ -148,9 +148,12 @@ where
         } else {
             bytecode
         };
-
+         
+         //TODO HAVE A BETTER DEPLOYMENT
+         // https://alloy.rs/examples/sol-macro/contract/
+        
         let interaction = Interaction::new(
-            Address::ZERO,
+            None,
             deploy_code,
             "constructor".to_string(),
             credentials,
@@ -276,7 +279,7 @@ where
         mode: ExecutionMode,
     ) -> RequestResult<InteractionData> {
         let interaction = Interaction::new(
-            self.address,
+            Some(self.address),
             function_data,
             function_name.to_string(),
             credentials,
@@ -298,7 +301,7 @@ where
         mode: ExecutionMode,
     ) -> RequestResult<InteractionData> {
         let interaction = Interaction::new(
-            self.address,
+            Some(self.address),
             function_data,
             function_name.to_string(),
             credentials,
@@ -417,7 +420,7 @@ where
         };
 
         let interaction = Interaction::new(
-            entry.address,
+            Some(entry.address),
             function_data,
             contract_function.to_string(),
             creds,

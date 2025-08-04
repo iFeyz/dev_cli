@@ -21,6 +21,15 @@ anvil \
   --accounts 10 \
   --balance 1000000000000000000
 
+
+
+  solc --bin --abi \
+  --base-path . \
+  --include-path node_modules \
+  aam_factory_sol.sol \
+  -o build --overwrite
+  
+
 - cargo run
 
 # TODO
@@ -29,4 +38,5 @@ anvil \
 - Create a smart contract deployer 
 - Add interaction to SM 
 - Add a deployer option
+
 

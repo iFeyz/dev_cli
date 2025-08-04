@@ -1,15 +1,38 @@
 use alloy::{
-    primitives::{Address, U256, Bytes},
+    primitives::{Address, U256, Bytes, B256, Log, LogData},
     signers::local::PrivateKeySigner,
-    rpc::types::{TransactionRequest, trace::parity::TraceType},
+    rpc::types::{TransactionRequest, trace::parity::TraceType, Filter},
     providers::{Provider, ext::TraceApi},
     network::{Network, TransactionBuilder, Ethereum, ReceiptResponse},
 };
-
 use async_trait::async_trait;
 use std::error::Error as StdError;
 use std::fmt;
 use std::marker::PhantomData;
+use alloy::primitives::{keccak256};
+use alloy_rlp::{RlpEncodable, RlpDecodable, Decodable, Encodable};
+use alloy::{providers::ProviderBuilder, sol};
+use alloy::sol_types::SolEvent;
+
+// CORRECTED EVENT DEFINITIONS TO MATCH YOUR ACTUAL CONTRACTS
+sol! {
+    // Your actual PoolFactory event
+    event PoolCreated(
+        uint256 indexed id,
+        address indexed token0,
+        address indexed token1,
+        uint8 fee,
+        address poolAddress
+    );
+    
+    // Keep this for compatibility with other factories
+    event PairCreated(
+        address indexed token0,
+        address indexed token1,
+        address pair,
+        uint256
+    );
+}
 
 #[derive(Debug, Clone)]
 pub enum RequestError {
@@ -104,7 +127,7 @@ pub struct RequestConfig {
 impl Default for RequestConfig {
     fn default() -> Self {
         Self {
-            gas_limit: U256::from(300_000),
+            gas_limit: U256::from(300_000_00),
             gas_price: U256::from(20_000_000_000u64), 
             nonce: None,
         }
@@ -347,7 +370,7 @@ pub struct InteractionData {
 }
 
 pub struct Interaction<N: Network = Ethereum> {
-    pub contract_address: Address,
+    pub contract_address: Option<Address>,
     pub function_data: Bytes,
     pub function_name: String,
     pub value: U256,
@@ -357,16 +380,35 @@ pub struct Interaction<N: Network = Ethereum> {
     _phantom: PhantomData<N>,
 }
 
+#[derive(Debug, RlpEncodable, RlpDecodable, PartialEq)]
+pub struct EncodedData {
+    pub a: u64,
+    pub b: Vec<u8>,
+}
+
 impl<N: Network> Interaction<N> {
     pub fn new(
-        contract_address: Address,
+        contract_address: Option<Address>,
         function_data: Bytes,
         function_name: String,
         credentials: UserCredentials,
         config: Option<RequestConfig>,
     ) -> Self {
+        if contract_address.is_none() {
+            return Self {
+                contract_address: None,
+                function_data,
+                function_name,
+                value: U256::ZERO,
+                config: config.unwrap_or_default(),
+                user_credentials: credentials,
+                execution_mode: ExecutionMode::Direct,
+                _phantom: PhantomData,
+            };
+        }
+
         Self {
-            contract_address,
+            contract_address: Some(contract_address.unwrap()),  
             function_data,
             function_name,
             value: U256::ZERO,
@@ -387,10 +429,18 @@ impl<N: Network> Interaction<N> {
         self
     }
 
-    fn build_transaction_request(&self) -> <N as Network>::TransactionRequest {
+    fn build_transaction_request(&self, is_deployment: bool) -> <N as Network>::TransactionRequest {
+        if is_deployment {
+            return <N as Network>::TransactionRequest::default()
+                .with_from(self.user_credentials.address())
+                .with_value(self.value)
+                .with_input(self.function_data.clone())
+                .with_gas_limit(self.config.gas_limit.to::<u64>())
+                .with_gas_price(self.config.gas_price.to::<u128>());
+        }
         <N as Network>::TransactionRequest::default()
             .with_from(self.user_credentials.address())
-            .with_to(self.contract_address)
+            .with_to(self.contract_address.unwrap())
             .with_value(self.value)
             .with_input(self.function_data.clone())
             .with_gas_limit(self.config.gas_limit.to::<u64>())
@@ -398,7 +448,6 @@ impl<N: Network> Interaction<N> {
     }
 
     fn validate(&self) -> Result<(), RequestError> {
-  
         if self.function_data.is_empty() {
             return Err(RequestError::ContractError("Function data cannot be empty".to_string()));
         }
@@ -416,6 +465,24 @@ impl<N: Network> Interaction<N> {
         }
     }
 
+    pub fn calculate_contract_address(deployer: Address, nonce: u64) -> Address {
+        let encoded_data = EncodedData {
+            a: nonce,
+            b: deployer.as_slice().to_vec(),
+        };
+        
+        // Create a buffer to hold the encoded data
+        let mut buf = Vec::new();
+        
+        // Encode into the buffer
+        encoded_data.encode(&mut buf);
+        
+        // Now use the buffer which contains the encoded bytes
+        let hash = keccak256(&buf);
+        
+        Address::from_slice(&hash[12..])
+    }
+
     async fn execute_direct<P>(&self, provider: &P) -> RequestResult<InteractionData>
     where
         P: Provider<N> + Send + Sync,
@@ -423,33 +490,150 @@ impl<N: Network> Interaction<N> {
         if let Err(e) = self.validate() {
             return RequestResult::error(e);
         }
-
+    
         println!("🚀 Executing contract interaction directly...");
-        let tx_request = self.build_transaction_request();
-
+        
+        let is_deployment = self.contract_address.is_none();
+        let is_pool_creation = self.function_name.contains("createPool") || 
+                              self.function_name.contains("createPair") ||
+                              self.function_name.contains("deploy");
+        
+        let nonce = if is_deployment {
+            match provider.get_transaction_count(self.user_credentials.address()).await {
+                Ok(n) => Some(n),
+                Err(e) => {
+                    println!("⚠️ Could not get nonce: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        
+        let tx_request = self.build_transaction_request(is_deployment);
+    
         match provider.send_transaction(tx_request).await {
             Ok(pending_tx) => {
-                let tx_hash = format!("{:?}", pending_tx.tx_hash());
-                println!("📝 Transaction sent: {}", tx_hash);
+                // Extract all needed values BEFORE any async operations
+                let tx_hash = *pending_tx.tx_hash(); // Dereference to get owned B256
+                let tx_hash_string = format!("{:?}", tx_hash);
                 
+                println!("📝 Transaction sent: {}", tx_hash_string);
+                
+                // Wait for receipt
                 match pending_tx.get_receipt().await {
                     Ok(receipt) => {
+                        // Get and print all logs from the transaction
+                        println!("\n📋 Fetching transaction logs...");
+                        
+                        // Get logs using eth_getLogs
+                        if let Ok(Some(full_receipt)) = provider.get_transaction_receipt(tx_hash).await {
+                            // Get the block number from receipt
+                            if let Some(block_number) = full_receipt.block_number() {
+                                let filter = Filter::new()
+                                    .from_block(0)
+                                    .to_block(1000000000000000000);
+                                
+                                if let Ok(logs) = provider.get_logs(&filter).await {
+                                    let tx_logs: Vec<_> = logs.into_iter()
+                                        .filter(|log| log.transaction_hash == Some(tx_hash))
+                                        .collect();
+                                    
+                                    println!("📋 Found {} logs in transaction", tx_logs.len());
+                                    
+                                    // Variable to store found pool address
+                                    let mut found_pool_address: Option<Address> = None;
+                                    
+                                    for (i, log) in tx_logs.iter().enumerate() {
+                                        println!("\n🔍 Log #{}:", i);
+                                        println!("  📍 Contract: {}", log.inner.address);
+                                        println!("  📑 Topics:");
+                                        for (j, topic) in log.topics().iter().enumerate() {
+                                            println!("    [{}]: {}", j, topic);
+                                        }
+                                        println!("  📦 Data: 0x{}", hex::encode(&log.inner.data.data));
+                                        
+                                        // Try to decode known events
+                                        let primitives_log = alloy::primitives::Log {
+                                            address: log.inner.address,
+                                            data: LogData::new_unchecked(
+                                                log.inner.topics().to_vec(),
+                                                log.inner.data.data.clone(),
+                                            ),
+                                        };
+                                        
+                                        // Try to identify the event
+                                        if log.topics().len() > 0 {
+                                            let event_sig = &log.topics()[0];
+                                            
+                                            // Check for your PoolCreated event
+                                            if *event_sig == keccak256("PoolCreated(uint256,address,address,uint8,address)") {
+                                                println!("  ✨ Event: PoolCreated");
+                                                if let Ok(decoded) = PoolCreated::decode_log(&primitives_log) {
+                                                    println!("    - ID: {}", decoded.id);
+                                                    println!("    - Token0: {}", decoded.token0);
+                                                    println!("    - Token1: {}", decoded.token1);
+                                                    println!("    - Fee: {}", decoded.fee);
+                                                    println!("    - Pool: {}", decoded.poolAddress);
+                                                    found_pool_address = Some(decoded.poolAddress);
+                                                }
+                                            } else if *event_sig == keccak256("PairCreated(address,address,address,uint256)") {
+                                                println!("  ✨ Event: PairCreated");
+                                                if let Ok(decoded) = PairCreated::decode_log(&primitives_log) {
+                                                    println!("    - Token0: {}", decoded.token0);
+                                                    println!("    - Token1: {}", decoded.token1);
+                                                    println!("    - Pair: {}", decoded.pair);
+                                                    found_pool_address = Some(decoded.pair);
+                                                }
+                                            } else {
+                                                println!("  ❓ Unknown event signature");
+                                            }
+                                        }
+                                    }
+                                    
+                                    // Update contract address if pool was found
+                                    if is_pool_creation && found_pool_address.is_some() {
+                                        let pool_addr = found_pool_address.unwrap();
+                                        println!("\n🎉 Pool successfully created at: {}", pool_addr);
+                                        
+                                        let data = InteractionData {
+                                            contract_address: pool_addr,
+                                            function_called: self.function_name.clone(),
+                                            return_data: Bytes::new(),
+                                            gas_used: U256::from(receipt.gas_used()),
+                                        };
+                                        
+                                        return RequestResult::success(data, Some(tx_hash_string), None);
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // Default handling if no pool address found
+                        let contract_address = if is_deployment {
+                            if let Some(addr) = receipt.contract_address() {
+                                addr
+                            } else if let Some(n) = nonce {
+                                Self::calculate_contract_address(self.user_credentials.address(), n)
+                            } else {
+                                return RequestResult::error(RequestError::ContractError("No contract address found".to_string()));
+                            }
+                        } else {
+                            self.contract_address.unwrap()
+                        };
+        
                         let data = InteractionData {
-                            contract_address: self.contract_address,
+                            contract_address,
                             function_called: self.function_name.clone(),
                             return_data: Bytes::new(),
-                            //return_data: receipt
-                            //    .logs()
-                            //    .first()
-                            //    .map(|log| log.data().data.clone())
-                            //    .unwrap_or_default(),
                             gas_used: U256::from(receipt.gas_used()),
                         };
                         
-                        println!("✅ Transaction confirmed");
+                        println!("\n✅ Transaction confirmed");
+                        println!("📍 Contract address: {}", contract_address);
                         println!("⛽ Gas used: {}", data.gas_used);
                         
-                        RequestResult::success(data, Some(tx_hash), None)
+                        RequestResult::success(data, Some(tx_hash_string), None)
                     }
                     Err(e) => RequestResult::error(RequestError::ContractError(e.to_string())),
                 }
@@ -457,7 +641,7 @@ impl<N: Network> Interaction<N> {
             Err(e) => RequestResult::error(RequestError::ContractError(e.to_string())),
         }
     }
-
+    
     async fn trace_only<P>(&self, provider: &P) -> RequestResult<InteractionData>
     where
         P: Provider<N> + Send + Sync,
@@ -494,7 +678,7 @@ impl<N: Network> Interaction<N> {
     where
         P: Provider<N> + Send + Sync,
     {
-        let tx_request = self.build_transaction_request();
+        let tx_request = self.build_transaction_request(false);
         
         match provider.estimate_gas(tx_request).await {
             Ok(gas_estimate) => {
@@ -510,7 +694,7 @@ impl<N: Network> Interaction<N> {
                 };
                 
                 let data = InteractionData {
-                    contract_address: self.contract_address,
+                    contract_address: self.contract_address.unwrap(),
                     function_called: self.function_name.clone(),
                     return_data: Bytes::new(),
                     gas_used: U256::from(gas_estimate),
@@ -593,7 +777,7 @@ impl<N: Network> InteractionBuilder<N> {
             .ok_or(RequestError::SigningError("Credentials not set".to_string()))?;
 
         Ok(Interaction {
-            contract_address,
+            contract_address: Some(contract_address),
             function_data,
             function_name,
             value: self.value,
@@ -603,4 +787,82 @@ impl<N: Network> InteractionBuilder<N> {
             _phantom: PhantomData,
         })
     }
+}
+
+async fn extract_pool_address_from_receipt<P, N>(
+    provider: &P,
+    tx_hash: B256,
+) -> Option<Address>
+where
+    P: Provider<N> + Send + Sync,
+    N: Network,
+{
+    // Use eth_getLogs to get logs for this transaction
+    let filter = alloy::rpc::types::Filter::new()
+        .from_block(0u64)
+        .to_block(u64::MAX)
+        .event_signature(vec![
+            // Your actual PoolCreated event signature
+            keccak256("PoolCreated(uint256,address,address,uint8,address)"),
+            // Keep PairCreated for compatibility
+            keccak256("PairCreated(address,address,address,uint256)"),
+        ]);
+    
+    match provider.get_logs(&filter).await {
+        Ok(logs) => {
+            for log in logs {
+                if log.transaction_hash == Some(tx_hash) {
+                    // Convert RPC log to primitives log for decoding
+                    let primitives_log = alloy::primitives::Log {
+                        address: log.inner.address,
+                        data: LogData::new_unchecked(
+                            log.inner.topics().to_vec(),
+                            log.inner.data.data.clone(),
+                        ),
+                    };
+                    
+                    let pool_addr = try_decode_pool_address(&primitives_log);
+                    if pool_addr.is_some() {
+                        return pool_addr;
+                    }
+                }
+            }
+        }
+        Err(e) => println!("Failed to get logs: {}", e),
+    }
+    
+    None
+}
+
+fn try_decode_pool_address(log: &Log) -> Option<Address> {
+    println!("🔍 Trying to decode pool address from log: {:?}", log);
+    // Try to decode as PoolCreated
+    if let Ok(decoded) = PoolCreated::decode_log(log) {
+        println!("✅ Found PoolCreated event: pool at {}", decoded.poolAddress);
+        return Some(decoded.poolAddress);
+    }
+    
+    // Try to decode as PairCreated
+    if let Ok(decoded) = PairCreated::decode_log(log) {
+        println!("✅ Found PairCreated event: pair at {}", decoded.pair);
+        return Some(decoded.pair);
+    }
+    
+    // Manual extraction as fallback
+    if log.topics().len() >= 1 && log.data.data.len() >= 32 {
+        // Many factories put pool address as last parameter in data
+        let start = log.data.data.len() - 32;
+        let addr_bytes = &log.data.data[start..];
+        
+        // Check if bytes 0-12 are zeros (indicating an address)
+        if addr_bytes[..12].iter().all(|&b| b == 0) {
+            let pool_address = Address::from_slice(&addr_bytes[12..32]);
+            if pool_address != Address::ZERO {
+                println!("📍 Extracted pool address from data: {}", pool_address);
+                return Some(pool_address);
+            }
+        }
+    }
+    
+    None
 }

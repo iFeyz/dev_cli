@@ -21,6 +21,7 @@ use alloy::transports::http::reqwest::Url;
 
 
 
+
 use crate::config::*;
 use crate::model::interaction::*;
 use crate::contract::contract_builder::*;
@@ -150,3 +151,242 @@ pub async fn example_deployment_and_interaction() -> Result<()> {
 
 // More simpler apporch with the ContractFactory 
 // More example needed here 
+
+
+sol!(
+    contract ERC20Token {
+        function name() public view returns (string);
+        function symbol() public view returns (string);
+        function decimals() public view returns (uint8);
+        function totalSupply() public view returns (uint256);
+        function balanceOf(address account) public view returns (uint256);
+    }
+);
+
+sol!(PoolFactory, "contract/aaam_factory/build/PoolFactory.json");
+
+
+pub async fn example_aam_factory_deploy_and_interact() -> Result<()> {
+    println!("🚀 Starting AMM Factory deployment example...\n");
+
+    // Utility function to read contract binary
+    fn read_contract_bin<P: AsRef<std::path::Path>>(path: P) -> Result<Bytes> {
+        let hex_str = std::fs::read_to_string(path)?.trim().to_string();
+        let bytes = hex::decode(hex_str).map_err(|_| anyhow::anyhow!("Failed to decode hex string"))?;
+        Ok(bytes.into())
+    }
+
+    // Utility function to load ABI from JSON file
+    fn get_abi_from_json(path: &str) -> Interface {
+        let json_str = std::fs::read_to_string(path).unwrap();
+        let json_abi: JsonAbi = serde_json::from_str(&json_str).unwrap();
+        Interface::new(json_abi)
+    }
+
+    // Setup
+    let private_key: PrivateKeySigner = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+        .parse().unwrap();
+    let credentials = UserCredentials::new(private_key);
+    let config = Config::load().unwrap();
+    let provider = Arc::new(ProviderBuilder::new().connect_http(config.rpc_url.parse::<Url>().unwrap()));
+
+    // ========== STEP 1: Deploy BNB Token ==========
+    println!("📦 Step 1: Deploying BNB Token...");
+    
+    let bnb_bytecode = read_contract_bin("contract/aaam_factory/build/BNB.bin").unwrap_or_else(|_| panic!("Failed to read BNB bytecode"));
+    let bnb_builder = ContractBuilder::<String, _, Ethereum>::new(provider.clone())
+        .with_bytecode(bnb_bytecode)
+        .with_credentials(credentials.clone())
+        .with_execution_mode(ExecutionMode::Direct)
+        .with_constructor_args(Bytes::from(vec![0u8; 32]));
+    
+    let bnb_deploy_result = bnb_builder.deploy().await;
+    
+    let bnb_address = match bnb_deploy_result {
+        RequestResult { 
+            success: true, 
+            data: Some(deployed),
+            transaction_hash: Some(tx_hash),
+            .. 
+        } => {
+            println!("✅ BNB Token deployed successfully!");
+            println!("  📍 Address: {}", deployed.address());
+            println!("  📝 Transaction: {}", tx_hash);
+            deployed.address()
+        }
+        RequestResult { success: false, error: Some(e), .. } => {
+            println!("❌ BNB deployment failed: {}", e);
+            return Err(anyhow::anyhow!("BNB deployment failed"));
+        }
+        _ => return Err(anyhow::anyhow!("Unexpected BNB deployment result")),
+    };
+
+    // ========== STEP 2: Deploy ChainLink Token ==========
+    println!("\n📦 Step 2: Deploying ChainLink Token...");
+    
+    let link_bytecode = read_contract_bin("contract/aaam_factory/build/ChainLink.bin").unwrap_or_else(|_| panic!("Failed to read ChainLink bytecode"));
+    let link_builder = ContractBuilder::<String, _, Ethereum>::new(provider.clone())
+        .with_bytecode(link_bytecode)
+        .with_credentials(credentials.clone())
+        .with_execution_mode(ExecutionMode::Direct)
+        .with_constructor_args(Bytes::from(vec![0u8; 32]));
+
+
+    
+    let link_deploy_result = link_builder.deploy().await;
+    
+    let link_address = match link_deploy_result {
+        RequestResult { 
+            success: true, 
+            data: Some(deployed),
+            transaction_hash: Some(tx_hash),
+            .. 
+        } => {
+            println!("✅ ChainLink Token deployed successfully!");
+            println!("  📍 Address: {}", deployed.address());
+            println!("  📝 Transaction: {}", tx_hash);
+            deployed.address()
+        }
+        RequestResult { success: false, error: Some(e), .. } => {
+            println!("❌ ChainLink deployment failed: {}", e);
+            return Err(anyhow::anyhow!("ChainLink deployment failed"));
+        }
+        _ => return Err(anyhow::anyhow!("Unexpected ChainLink deployment result")),
+    };
+
+    // Verify token deployments by checking their symbols
+    println!("\n🔍 Verifying token deployments...");
+    
+    // You can add verification calls here using the token ABIs if needed
+    
+    // ========== STEP 3: Deploy Pool Factory ==========
+    println!("\n📦 Step 3: Deploying Pool Factory...");
+    
+    let factory_bytecode = read_contract_bin("contract/aaam_factory/build/PoolFactory.bin")?;
+    let factory_builder = ContractBuilder::<String, _, Ethereum>::new(provider.clone())
+        .with_bytecode(factory_bytecode)
+        .with_credentials(credentials.clone())
+        .with_execution_mode(ExecutionMode::Direct);
+  
+    
+    let factory_deploy_result = factory_builder.deploy().await;
+    
+    let factory_contract = match factory_deploy_result {
+        RequestResult { 
+            success: true, 
+            data: Some(deployed),
+            transaction_hash: Some(tx_hash),
+            .. 
+        } => {
+            println!("✅ Pool Factory deployed successfully!");
+            println!("  📍 Address: {}", deployed.address());
+            println!("  📝 Transaction: {}", tx_hash);
+            deployed
+        }
+        RequestResult { success: false, error: Some(e), .. } => {
+            println!("❌ Factory deployment failed: {}", e);
+            return Err(anyhow::anyhow!("Factory deployment failed"));
+        }
+        _ => return Err(anyhow::anyhow!("Unexpected factory deployment result")),
+    };
+
+    // ========== STEP 4: Create Pool with Deployed Tokens ==========
+    println!("\n📦 Step 4: Creating pool with deployed tokens...");
+    
+    // Ensure correct token ordering (token0 < token1)
+    let (token0, token1) = if bnb_address < link_address {
+        (bnb_address, link_address)
+    } else {
+        (link_address, bnb_address)
+    };
+    
+    println!("  Token0: {} ({})", token0, if token0 == bnb_address { "BNB" } else { "LINK" });
+    println!("  Token1: {} ({})", token1, if token1 == bnb_address { "BNB" } else { "LINK" });
+    println!("  Fee: 3000 (0.3%)");
+    
+    // Load factory ABI and create instance
+    let factory_interface = get_abi_from_json("contract/aaam_factory/build/PoolFactory.json");
+    let factory_address = factory_contract.address(); // Save this first
+    let factory_instance = factory_contract.instance(factory_interface);
+    
+    // Encode createPool call
+    let create_pool_data = PoolFactory::createPoolCall {
+        token0,
+        token1,
+        fee: 30 as u8, // 0.3% fee tier (common for most AMMs)
+    }.abi_encode();
+    
+    // Execute createPool
+    let pool_result = factory_instance.call_function(
+        "createPool",
+        create_pool_data.into(),
+        credentials.clone(),
+        None,
+        ExecutionMode::Direct,
+    ).await;
+    
+    match pool_result {
+        RequestResult { 
+            success: true, 
+            data: Some(data), 
+            transaction_hash: Some(tx_hash),
+            .. 
+        } => {
+            println!("\n✅ Pool created successfully!");
+            println!("  📝 Transaction: {}", tx_hash);
+            println!("  ⛽ Gas used: {}", data.gas_used);
+            
+            // The pool address should be in the logs or we need to query it
+            // Try to get pool address using getPool function if available
+            println!("\n🔍 Retrieving pool address...");
+
+            let token0 : Address = bnb_address;
+            let token1 : Address = link_address;
+            
+            // Encode getPool call (if the factory has this function)
+            let get_pool_selector = &alloy::primitives::keccak256("getPool(address,address,uint8)")[..4];
+            let mut calldata = get_pool_selector.to_vec();
+            calldata.extend_from_slice(&token0.as_slice());
+            calldata.extend_from_slice(&token1.as_slice());
+            let mut fee_bytes = [0u8; 32];
+            fee_bytes[31] = 30;
+            calldata.extend_from_slice(&fee_bytes); // 32 bytes
+                
+            // Try to call getPool
+            match provider.call(
+                alloy::rpc::types::TransactionRequest::default()
+                    .to(factory_address)
+                    .input(calldata.into()),
+            ).await {
+                Ok(result) if result.len() >= 32 => {
+                    let pool_address = Address::from_slice(&result[12..32]);
+                    if pool_address != Address::ZERO {
+                        println!("  📍 Pool address: {}", pool_address);
+                        println!("\n🎉 AMM Pool successfully created between BNB and ChainLink tokens!");
+                    }
+                }
+                _ => {
+                    println!("  ⚠️ Could not retrieve pool address (might need to check logs)");
+                }
+            }
+        }
+        RequestResult { success: false, error: Some(e), .. } => {
+            println!("\n❌ Pool creation failed: {}", e);
+            
+            // Common issues and solutions
+            println!("\n💡 Troubleshooting tips:");
+            println!("  - Ensure the fee tier (3000) is supported by the factory");
+            println!("  - Check if a pool already exists for this token pair");
+            println!("  - Verify token addresses are valid ERC20 contracts");
+            println!("  - Ensure tokens are properly ordered (token0 < token1)");
+        }
+        _ => println!("\n❌ Pool creation failed with unknown error"),
+    }
+    
+    println!("\n✨ Deployment summary:");
+    println!("  BNB Token:     {}", bnb_address);
+    println!("  ChainLink Token: {}", link_address);
+    println!("  Pool Factory:  {}", factory_address);
+    
+    Ok(())
+}
