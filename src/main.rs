@@ -4,6 +4,7 @@ mod config;
 mod model;
 mod contract;
 mod examples;
+mod universal;
 
 use interactive::menu::InteractiveMenu;
 use dotenvy::dotenv;

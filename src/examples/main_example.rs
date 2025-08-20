@@ -382,6 +382,9 @@ pub async fn example_aam_factory_deploy_and_interact() -> Result<()> {
         }
         _ => println!("\n❌ Pool creation failed with unknown error"),
     }
+
+    // ========== STEP 5: Adding liquidity to the pool==========
+    //TODO
     
     println!("\n✨ Deployment summary:");
     println!("  BNB Token:     {}", bnb_address);
